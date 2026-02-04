@@ -1,0 +1,807 @@
+############################################
+## MASTER PIPELINE — snRNA-seq (Seurat v5.4.0, R 4.5.2)
+## - QC first (strict percent.mt < 3%, exclude mt-genes from HVG/plots/DE outputs)
+## - Build object from 10x folders (2+2+3+3)
+## - Harmony batch correction (batch = sample) for embedding/clustering ONLY
+## - Cell type labeling: MG, AC, EC, Neu, PC, Other (PC separate)
+## - Pseudobulk edgeR:
+##   (A) Within each model: CKD vs CTRL per celltype  -> Excel per celltype
+##   (B) CKD-only: CKD2 vs CKD1 per celltype          -> Excel + Volcano
+##   (C) Delta-effect: (CKD2 CKDvsCTRL logFC - CKD1 CKDvsCTRL logFC) -> Excel
+## - Heatmaps + Violins saved automatically
+############################################
+
+## =========================
+## 0) PATHS + OUTPUTS
+## =========================
+set.seed(1)
+options(stringsAsFactors = FALSE)
+options(scipen = 999)
+
+base_dir <- "E:/CKD1vs2_new/CKD1vsCKD2_manuscript/submit/newnalysis/260203_final1"
+setwd(base_dir)
+
+out_fig   <- file.path(base_dir, "FIGURES_publication")
+out_xlsx  <- file.path(base_dir, "EXCEL_tables")
+out_csv   <- file.path(base_dir, "CSV_tables")
+
+dir.create(out_fig,  showWarnings = FALSE, recursive = TRUE)
+dir.create(out_xlsx, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_csv,  showWarnings = FALSE, recursive = TRUE)
+
+## =========================
+## 1) PACKAGES (robust)
+## =========================
+pkg_cran <- c("Seurat","SeuratObject","harmony","Matrix","dplyr","tidyr","ggplot2","openxlsx","patchwork","ggrepel")
+pkg_bioc <- c("edgeR","limma","sva")
+
+ip <- rownames(installed.packages())
+to_install <- setdiff(pkg_cran, ip)
+if (length(to_install) > 0) install.packages(to_install)
+
+if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
+for (p in pkg_bioc) {
+  if (!(p %in% ip)) BiocManager::install(p, ask=FALSE, update=FALSE)
+}
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(harmony)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(openxlsx)
+  library(patchwork)
+  library(ggrepel)
+  library(edgeR)
+  library(limma)
+  library(sva)
+})
+
+## =========================
+## 2) INPUT 10x FOLDERS
+## =========================
+# ---- CKD1 = Adenine diet ----
+paths_ckd1_ctrl <- c(
+  "E:/CKD1vsCKD2/c1/",
+  "E:/CKD1vsCKD2/c2/"
+)
+paths_ckd1_ckd <- c(
+  "E:/CKD1vsCKD2/ckd1/",
+  "E:/CKD1vsCKD2/ckd2/"
+)
+
+# ---- CKD2 = 5/6 Nx ----
+paths_ckd2_ctrl <- c(
+  "E:/CKD1vsCKD2/210626CKD-5vs4/c/",
+  "E:/CKD1vsCKD2/210626CKD-1vs6/c/",
+  "E:/CKD1vsCKD2/210619CKD-3vs1/c/"
+)
+paths_ckd2_ckd <- c(
+  "E:/CKD1vsCKD2/210626CKD-5vs4/ckd/",
+  "E:/CKD1vsCKD2/210626CKD-1vs6/ckd/",
+  "E:/CKD1vsCKD2/210619CKD-3vs1/ckd/"
+)
+
+## =========================
+## 3) HELPERS
+## =========================
+is_mt_gene <- function(g) grepl("^mt-", g, ignore.case = FALSE)
+
+read_one_10x <- function(sample_name, data_dir,
+                         model_label = c("CKD1","CKD2"),
+                         condition_label = c("CTRL","CKD"),
+                         min.cells = 3, min.features = 200) {
+  
+  model_label <- match.arg(model_label)
+  condition_label <- match.arg(condition_label)
+  
+  counts <- Read10X(data.dir = data_dir)
+  
+  obj <- CreateSeuratObject(
+    counts = counts,
+    assay = "RNA",
+    project = sample_name,
+    min.cells = min.cells,
+    min.features = min.features
+  )
+  
+  obj$sample    <- sample_name
+  obj$model     <- model_label
+  obj$condition <- condition_label
+  obj$batch     <- sample_name  # IMPORTANT: batch = sample (technical), NOT model
+  
+  return(obj)
+}
+
+save_plot <- function(p, filename, w=7, h=5, dpi=400) {
+  ggsave(filename = filename, plot = p, width = w, height = h, dpi = dpi)
+}
+
+# Pseudobulk (SUM raw counts per sample or sample+meta)
+make_pseudobulk <- function(seu_obj, group_vars = c("sample","model","condition","celltype6"),
+                            assay="RNA", layer="counts") {
+  DefaultAssay(seu_obj) <- assay
+  seu_obj[[assay]] <- JoinLayers(seu_obj[[assay]])
+  
+  counts <- GetAssayData(seu_obj, layer = layer)  # genes x cells
+  meta   <- as.data.frame(seu_obj@meta.data)
+  
+  stopifnot(all(group_vars %in% colnames(meta)))
+  meta$.grp <- apply(meta[, group_vars, drop=FALSE], 1, paste, collapse="__")
+  groups <- unique(meta$.grp)
+  
+  pb <- sapply(groups, function(g) {
+    cells <- rownames(meta)[meta$.grp == g]
+    Matrix::rowSums(counts[, cells, drop=FALSE])
+  })
+  pb <- as.matrix(pb)
+  colnames(pb) <- groups
+  
+  pb_meta <- meta %>%
+    dplyr::select(all_of(group_vars), .grp) %>%
+    distinct(.grp, .keep_all=TRUE) %>%
+    as.data.frame()
+  rownames(pb_meta) <- pb_meta$.grp
+  
+  list(counts = pb, meta = pb_meta)
+}
+
+run_edger <- function(pb_counts, pb_meta, contrast_var,
+                      ident_1, ident_2,
+                      min_libsize = 2000) {
+  
+  # filter low-depth pseudobulk columns
+  lib <- colSums(pb_counts)
+  keep <- lib >= min_libsize
+  pb_counts <- pb_counts[, keep, drop=FALSE]
+  pb_meta   <- pb_meta[colnames(pb_counts), , drop=FALSE]
+  
+  if (ncol(pb_counts) < 2) return(NULL)
+  if (!all(c(ident_1, ident_2) %in% unique(pb_meta[[contrast_var]]))) return(NULL)
+  
+  pb_meta[[contrast_var]] <- factor(pb_meta[[contrast_var]], levels = c(ident_2, ident_1))
+  design <- model.matrix(~ pb_meta[[contrast_var]])
+  
+  y <- DGEList(counts = pb_counts)
+  y <- calcNormFactors(y)
+  y <- estimateDisp(y, design)
+  fit <- glmQLFit(y, design)
+  qlf <- glmQLFTest(fit, coef = 2)
+  
+  tt <- topTags(qlf, n=Inf)$table
+  tt$gene <- rownames(tt)
+  rownames(tt) <- NULL
+  
+  # exclude mt genes from outputs (snRNA hygiene)
+  tt <- tt[!is_mt_gene(tt$gene), , drop=FALSE]
+  tt
+}
+
+write_xlsx_one <- function(df, file, sheet="Sheet1") {
+  # Excel outputs should be robust (no broken columns / easy to read)
+  wb <- createWorkbook()
+  addWorksheet(wb, sheet)
+  
+  writeDataTable(
+    wb, sheet, df,
+    withFilter = TRUE,
+    tableStyle = "TableStyleMedium9"
+  )
+  
+  # header formatting + usability
+  headerStyle <- createStyle(textDecoration = "bold")
+  addStyle(wb, sheet, style = headerStyle, rows = 1, cols = 1:ncol(df), gridExpand = TRUE)
+  freezePane(wb, sheet, firstRow = TRUE)
+  setColWidths(wb, sheet, cols = 1:ncol(df), widths = "auto")
+  
+  saveWorkbook(wb, file, overwrite = TRUE)
+}
+
+## =========================
+## 4) BUILD OBJECTS (2+2+3+3)
+## =========================
+objs <- list(
+  CKD1_CTRL1 = read_one_10x("CKD1_CTRL1", paths_ckd1_ctrl[1], "CKD1", "CTRL"),
+  CKD1_CTRL2 = read_one_10x("CKD1_CTRL2", paths_ckd1_ctrl[2], "CKD1", "CTRL"),
+  CKD1_CKD1  = read_one_10x("CKD1_CKD1",  paths_ckd1_ckd[1],  "CKD1", "CKD"),
+  CKD1_CKD2  = read_one_10x("CKD1_CKD2",  paths_ckd1_ckd[2],  "CKD1", "CKD"),
+  CKD2_CTRL1 = read_one_10x("CKD2_CTRL1", paths_ckd2_ctrl[1], "CKD2", "CTRL"),
+  CKD2_CTRL2 = read_one_10x("CKD2_CTRL2", paths_ckd2_ctrl[2], "CKD2", "CTRL"),
+  CKD2_CTRL3 = read_one_10x("CKD2_CTRL3", paths_ckd2_ctrl[3], "CKD2", "CTRL"),
+  CKD2_CKD1  = read_one_10x("CKD2_CKD1",  paths_ckd2_ckd[1],  "CKD2", "CKD"),
+  CKD2_CKD2  = read_one_10x("CKD2_CKD2",  paths_ckd2_ckd[2],  "CKD2", "CKD"),
+  CKD2_CKD3  = read_one_10x("CKD2_CKD3",  paths_ckd2_ckd[3],  "CKD2", "CKD")
+)
+
+ckd <- Reduce(function(x,y) merge(x,y), objs)
+DefaultAssay(ckd) <- "RNA"
+ckd[["RNA"]] <- JoinLayers(ckd[["RNA"]])
+
+## =========================
+## 5) QC FIRST (snRNA): percent.mt < 6%
+## =========================
+ckd[["percent.mt"]] <- PercentageFeatureSet(ckd, pattern="^mt-")
+
+# QC plots
+p_mt <- VlnPlot(ckd, features="percent.mt", group.by="sample", pt.size=0) + theme_classic(base_size=12)
+save_plot(p_mt, file.path(out_fig, "QC_percentMT_bySample.png"), w=14, h=5, dpi=350)
+
+# strict filtering (your requirement)
+ckd <- subset(ckd, subset = percent.mt < 6)
+
+## =========================
+## 6) CELLTYPE LABELING: MG/AC/EC/Neu/PC/Other + OC
+## =========================
+marker_list6 <- list(
+  MG  = c("P2ry12","Cx3cr1","Tmem119","Aif1","Csf1r","Sall1"),
+  AC  = c("Aqp4","Aldh1l1","Slc1a2","Gfap","Atp1a2","Gja1"),
+  EC  = c("Pecam1","Kdr","Flt1","Tek","Apold1","Klf2"),
+  Neu = c("Snap25","Rbfox3","Syt1","Tubb3","Stmn2","Map2"),
+  OC  = c("Plp1","Mbp","Mog","Mobp","Olig1","Olig2","Sox10"),
+  PC  = c("Rgs5","Pdgfrb","Kcnj8","Des","Cspg4","Acta2")
+)
+
+ckd <- NormalizeData(ckd, verbose=FALSE)
+
+scores <- sapply(names(marker_list6), function(ct){
+  genes <- marker_list6[[ct]]
+  genes <- genes[genes %in% rownames(ckd)]
+  if (length(genes)==0) return(rep(0, ncol(ckd)))
+  Matrix::colMeans(GetAssayData(ckd, layer="data")[genes,,drop=FALSE])
+})
+scores <- as.data.frame(scores)
+
+ckd$celltype6 <- apply(scores, 1, function(x) names(x)[which.max(x)])
+ckd$celltype6_score <- apply(scores, 1, max)
+
+ckd$celltype6 <- ifelse(ckd$celltype6_score < 0.05, "Other", ckd$celltype6)
+ckd$celltype6 <- factor(ckd$celltype6, levels=c("MG","AC","EC","Neu","OC","PC","Other"))
+Idents(ckd) <- ckd$celltype6
+
+## =========================
+## 7) HARMONY (batch correction BEFORE clustering)
+## =========================
+DefaultAssay(ckd) <- "RNA"
+ckd[["RNA"]] <- JoinLayers(ckd[["RNA"]])
+
+ckd <- FindVariableFeatures(ckd, nfeatures=3000, verbose=FALSE)
+VariableFeatures(ckd) <- setdiff(VariableFeatures(ckd), rownames(ckd)[is_mt_gene(rownames(ckd))])
+
+ckd <- ScaleData(ckd, features = VariableFeatures(ckd), verbose=FALSE)
+ckd <- RunPCA(ckd, npcs=30, verbose=FALSE)
+
+ckd <- RunHarmony(ckd, group.by.vars="batch")
+
+ckd <- RunUMAP(ckd, reduction="harmony", dims=1:12)
+ckd <- FindNeighbors(ckd, reduction="harmony", dims=1:12)
+ckd <- FindClusters(ckd, resolution=0.3)
+
+p_um1 <- DimPlot(ckd, group.by="sample") + ggtitle("Harmony UMAP by sample") + theme_classic()
+p_um2 <- DimPlot(ckd, group.by="model") + ggtitle("Harmony UMAP by model") + theme_classic()
+p_um3 <- DimPlot(ckd, group.by="condition") + ggtitle("Harmony UMAP by condition") + theme_classic()
+p_um4 <- DimPlot(ckd, group.by="celltype6", label=TRUE, repel=TRUE) + ggtitle("Harmony UMAP by celltype6") + theme_classic()
+save_plot(p_um1, file.path(out_fig, "UMAP_bySample.png"), w=7, h=6)
+save_plot(p_um2, file.path(out_fig, "UMAP_byModel.png"),  w=7, h=6)
+save_plot(p_um3, file.path(out_fig, "UMAP_byCondition.png"), w=7, h=6)
+save_plot(p_um4, file.path(out_fig, "UMAP_byCelltype6.png"), w=7, h=6)
+
+DefaultAssay(ckd) <- "RNA"
+Idents(ckd) <- ckd$seurat_clusters
+cl_markers <- FindAllMarkers(ckd, only.pos=TRUE, min.pct=0.25, logfc.threshold=0.25, test.use="wilcox")
+cl_markers <- cl_markers[!is_mt_gene(cl_markers$gene),]
+write.csv(cl_markers, file.path(out_csv, "ClusterMarkers_FindAllMarkers_noMT.csv"), row.names=FALSE)
+
+# =========================
+# 7B) CLUSTER QUALITY CHECK: Violin plots of canonical cell markers across clusters
+# =========================
+cl_vln_dir <- file.path(out_fig, "VIOLINS_ClusterQuality_Markers")
+dir.create(cl_vln_dir, showWarnings=FALSE, recursive=TRUE)
+
+DefaultAssay(ckd) <- "RNA"
+ckd[["RNA"]] <- JoinLayers(ckd[["RNA"]])
+if (!"data" %in% Layers(ckd[["RNA"]])) {
+  ckd <- NormalizeData(ckd, verbose=FALSE)
+}
+
+Idents(ckd) <- ckd$seurat_clusters
+
+for (ct in names(marker_list6)) {
+  feats <- marker_list6[[ct]]
+  feats <- feats[feats %in% rownames(ckd)]
+  if (length(feats) == 0) next
+  
+  p <- VlnPlot(ckd, features=feats, group.by="seurat_clusters", pt.size=0, ncol=3) +
+    theme_classic(base_size=14) +
+    ggtitle(paste0("Cluster QC — ", ct, " markers"))
+  
+  save_plot(p, file.path(cl_vln_dir, paste0("CLUSTERQC_VIOLIN_", ct, "_markers_byCluster.png")), w=12, h=7, dpi=450)
+  ggsave(file.path(cl_vln_dir, paste0("CLUSTERQC_VIOLIN_", ct, "_markers_byCluster.pdf")), plot=p, width=12, height=7)
+}
+
+all_markers <- unique(unlist(marker_list6))
+all_markers <- all_markers[all_markers %in% rownames(ckd)]
+if (length(all_markers) > 0) {
+  p_all <- VlnPlot(ckd, features=all_markers, group.by="seurat_clusters", pt.size=0, ncol=4) +
+    theme_classic(base_size=13) +
+    ggtitle("Cluster QC — All canonical markers")
+  
+  save_plot(p_all, file.path(cl_vln_dir, "CLUSTERQC_VIOLIN_AllMarkers_byCluster.png"), w=14, h=10, dpi=450)
+  ggsave(file.path(cl_vln_dir, "CLUSTERQC_VIOLIN_AllMarkers_byCluster.pdf"), plot=p_all, width=14, height=10)
+}
+
+## =========================
+## 7B) 🔶 CLUSTER MARKER VIOLINS + MANUAL CELLTYPE MAPPING (USER-CONTROLLED)
+## =========================
+Idents(ckd) <- ckd$seurat_clusters
+
+marker_check_genes <- unique(unlist(marker_list6))
+marker_check_genes <- marker_check_genes[marker_check_genes %in% rownames(ckd)]
+
+pdf(file.path(out_fig, "ClusterMarker_ViolinPlots_byCluster.pdf"), width = 12, height = 8)
+for (g in marker_check_genes) {
+  p <- VlnPlot(ckd, features = g, group.by = "seurat_clusters", pt.size = 0) +
+    theme_classic(base_size = 12) +
+    ggtitle(paste0("Cluster marker: ", g))
+  print(p)
+}
+dev.off()
+
+print(table(ckd$seurat_clusters))
+
+USE_MANUAL_CELLTYPE_MAPPING <- TRUE
+
+cluster_to_celltype <- c(
+  `15` = "MG",
+  `8`  = "AC",
+  `4`  = "AC",
+  `13` = "EC",
+  `0`  = "Neu",
+  `1`  = "Neu",
+  `2`  = "Neu",
+  `3`  = "Neu",
+  `9`  = "Neu",
+  `6`  = "OC",
+  `16` = "OC",
+  `12` = "PC"
+  # unmapped -> Other
+)
+
+if (USE_MANUAL_CELLTYPE_MAPPING) {
+  cl <- as.character(ckd$seurat_clusters)
+  mapped <- unname(cluster_to_celltype[cl])
+  mapped[is.na(mapped)] <- "Other"
+  ckd$celltype6 <- factor(mapped, levels = c("MG","AC","EC","Neu","OC","PC","Other"))
+  message("Manual cluster->celltype mapping applied (ckd$celltype6 updated).")
+}
+
+## =========================
+## 8) SUBSET
+## =========================
+ckd.sub <- ckd
+Idents(ckd.sub) <- ckd.sub$celltype6
+
+meta_counts <- as.data.frame(ckd.sub@meta.data)
+cell_counts <- meta_counts %>%
+  count(model, condition, celltype6, name="n_cells") %>%
+  arrange(celltype6, model, condition)
+write.csv(cell_counts, file.path(out_csv, "CellCounts_model_condition_celltype6.csv"), row.names=FALSE)
+write_xlsx_one(cell_counts, file.path(out_xlsx, "CellCounts_model_condition_celltype6.xlsx"), sheet="counts")
+
+## =========================
+## 9) PSEUDOBULK edgeR
+## =========================
+celltypes <- c("MG","AC","EC","Neu","OC","PC","Other")
+models <- c("CKD1","CKD2")
+
+## 9A) Within each model: CKD vs CTRL per celltype
+de_within_all <- list()
+
+for (ct in celltypes) {
+  for (m in models) {
+    sub <- subset(ckd.sub, subset = celltype6 == ct & model == m)
+    if (ncol(sub) < 50) next
+    if (length(unique(sub$sample)) < 2) next
+    if (!all(c("CTRL","CKD") %in% unique(sub$condition))) next
+    
+    pb <- make_pseudobulk(sub, group_vars=c("sample","model","condition","celltype6"))
+    pb_meta <- pb$meta[colnames(pb$counts), , drop=FALSE]
+    
+    res <- run_edger(pb$counts, pb_meta, contrast_var="condition", ident_1="CKD", ident_2="CTRL")
+    if (is.null(res)) next
+    
+    res$celltype <- ct
+    res$model <- m
+    res$comparison <- "CKD_vs_CTRL"
+    
+    de_within_all[[paste(ct,m,sep="__")]] <- res
+  }
+}
+
+de_within_tbl <- bind_rows(de_within_all)
+write.csv(de_within_tbl, file.path(out_csv, "edgeR_withinModel_CKDvsCTRL_allCelltypes.csv"), row.names=FALSE)
+
+for (ct in celltypes) {
+  df <- de_within_tbl %>% filter(celltype==ct)
+  if (nrow(df)==0) next
+  
+  wb <- createWorkbook()
+  addWorksheet(wb, "CKD1_CKDvsCTRL")
+  addWorksheet(wb, "CKD2_CKDvsCTRL")
+  
+  df1 <- df %>% filter(model=="CKD1") %>% arrange(FDR)
+  df2 <- df %>% filter(model=="CKD2") %>% arrange(FDR)
+  
+  writeDataTable(wb, "CKD1_CKDvsCTRL", df1, withFilter=TRUE, tableStyle="TableStyleMedium9")
+  writeDataTable(wb, "CKD2_CKDvsCTRL", df2, withFilter=TRUE, tableStyle="TableStyleMedium9")
+  
+  headerStyle <- createStyle(textDecoration="bold")
+  addStyle(wb, "CKD1_CKDvsCTRL", style=headerStyle, rows=1, cols=1:ncol(df1), gridExpand=TRUE)
+  addStyle(wb, "CKD2_CKDvsCTRL", style=headerStyle, rows=1, cols=1:ncol(df2), gridExpand=TRUE)
+  freezePane(wb, "CKD1_CKDvsCTRL", firstRow=TRUE)
+  freezePane(wb, "CKD2_CKDvsCTRL", firstRow=TRUE)
+  if (ncol(df1) > 0) setColWidths(wb, "CKD1_CKDvsCTRL", cols=1:ncol(df1), widths="auto")
+  if (ncol(df2) > 0) setColWidths(wb, "CKD2_CKDvsCTRL", cols=1:ncol(df2), widths="auto")
+  
+  saveWorkbook(wb, file.path(out_xlsx, paste0("edgeR_WITHINMODEL_CKDvsCTRL_", ct, ".xlsx")), overwrite=TRUE)
+}
+
+## 9B) CKD-only: CKD2 vs CKD1 per celltype
+de_ckdonly_all <- list()
+
+for (ct in celltypes) {
+  sub <- subset(ckd.sub, subset = celltype6 == ct & condition == "CKD")
+  if (ncol(sub) < 50) next
+  if (length(unique(sub$sample)) < 2) next
+  if (!all(c("CKD1","CKD2") %in% unique(sub$model))) next
+  
+  pb <- make_pseudobulk(sub, group_vars=c("sample","model","celltype6","condition"))
+  pb_meta <- pb$meta[colnames(pb$counts), , drop=FALSE]
+  
+  res <- run_edger(pb$counts, pb_meta, contrast_var="model", ident_1="CKD2", ident_2="CKD1")
+  if (is.null(res)) next
+  
+  res$celltype <- ct
+  res$comparison <- "CKD2_vs_CKD1_within_CKDonly"
+  res$neglog10FDR <- -log10(pmax(res$FDR, 1e-300))
+  
+  de_ckdonly_all[[ct]] <- res
+  
+  write_xlsx_one(res %>% arrange(FDR),
+                 file.path(out_xlsx, paste0("edgeR_CKDONLY_CKD2vsCKD1_", ct, ".xlsx")),
+                 sheet="CKD2_vs_CKD1_CKDonly")
+  
+  top_lab <- res %>%
+    arrange(FDR) %>%
+    head(25)
+  
+  pvol <- ggplot(res, aes(x=logFC, y=neglog10FDR)) +
+    geom_point(alpha=0.6, size=1.6) +
+    geom_vline(xintercept=0, linetype="dashed") +
+    geom_hline(yintercept=-log10(0.05), linetype="dotted") +
+    ggrepel::geom_text_repel(data=top_lab, aes(label=gene), size=3, max.overlaps=Inf) +
+    theme_classic(base_size=14) +
+    labs(title=paste0(ct, " (CKD-only): CKD2 vs CKD1"),
+         x="log2FC (CKD2 / CKD1)", y="-log10(FDR)")
+  
+  save_plot(pvol, file.path(out_fig, paste0("VOLCANO_", ct, "_CKDonly_CKD2vsCKD1.png")), w=7, h=6, dpi=450)
+  ggsave(file.path(out_fig, paste0("VOLCANO_", ct, "_CKDonly_CKD2vsCKD1.pdf")), plot=pvol, width=7, height=6)
+}
+
+de_ckdonly_tbl <- bind_rows(de_ckdonly_all)
+write.csv(de_ckdonly_tbl, file.path(out_csv, "edgeR_CKDonly_CKD2vsCKD1_allCelltypes.csv"), row.names=FALSE)
+
+## 9C) Delta-effect
+delta_all <- list()
+for (ct in celltypes) {
+  a <- de_within_tbl %>% filter(celltype==ct, model=="CKD1") %>% select(gene, logFC, FDR) %>%
+    rename(logFC_CKD1=logFC, FDR_CKD1=FDR)
+  b <- de_within_tbl %>% filter(celltype==ct, model=="CKD2") %>% select(gene, logFC, FDR) %>%
+    rename(logFC_CKD2=logFC, FDR_CKD2=FDR)
+  if (nrow(a)==0 || nrow(b)==0) next
+  
+  ab <- full_join(a,b, by="gene") %>%
+    mutate(delta_logFC = logFC_CKD2 - logFC_CKD1,
+           celltype = ct) %>%
+    arrange(desc(abs(delta_logFC)))
+  
+  delta_all[[ct]] <- ab
+  write_xlsx_one(ab,
+                 file.path(out_xlsx, paste0("DELTA_effect_CKD2minusCKD1_CKDvsCTRL_", ct, ".xlsx")),
+                 sheet="delta_logFC")
+}
+delta_tbl <- bind_rows(delta_all)
+write.csv(delta_tbl, file.path(out_csv, "DELTA_effect_CKD2minusCKD1_allCelltypes.csv"), row.names=FALSE)
+
+## =========================
+## 10) HEATMAPS (Top20 UP/DOWN) per celltype (CKD-only CKD2 vs CKD1)
+##     ✅ FIXED: robust base-R heatmap + legend/scale (no image.default errors)
+## =========================
+heat_dir <- file.path(out_fig, "HEATMAPS_Top20")
+dir.create(heat_dir, showWarnings=FALSE, recursive=TRUE)
+
+# Helper: draw heatmap + right-side scale bar INSIDE the same PNG
+plot_heatmap_image <- function(mat_center, col_labels, main_title, file,
+                               cluster_rows=FALSE,
+                               width=1600, height=1200, res=200,
+                               cex_col=0.7, cex_row=0.55,
+                               scale_label="Centered log1p (gene-centered)") {
+  mat_center <- as.matrix(mat_center)
+  if (nrow(mat_center) < 2 || ncol(mat_center) < 2) return(invisible(NULL))
+  
+  if (cluster_rows && nrow(mat_center) > 1) {
+    ord <- stats::hclust(stats::dist(mat_center))$order
+    mat_center <- mat_center[ord, , drop=FALSE]
+  }
+  
+  cols <- colorRampPalette(c("blue","grey90","red"))(101)
+  zlim <- range(mat_center, finite=TRUE)
+  if (!is.finite(zlim[1]) || !is.finite(zlim[2]) || zlim[1] == zlim[2]) {
+    zlim <- c(-1, 1)
+  }
+  
+  png(file, width=width, height=height, res=res)
+  layout(matrix(c(1,2), nrow=1), widths=c(4.5, 1.0))
+  par(mar=c(6,10,3,2))
+  
+  # heatmap with explicit x/y to avoid dimension mismatches
+  z <- t(mat_center[nrow(mat_center):1, , drop=FALSE])   # ncol x nrow
+  image(x = seq_len(ncol(mat_center)),
+        y = seq_len(nrow(mat_center)),
+        z = z,
+        col = cols, zlim = zlim, axes = FALSE,
+        main = main_title, xlab = "", ylab = "")
+  
+  axis(1, at=seq_len(ncol(mat_center)), labels=col_labels, las=2, cex.axis=cex_col)
+  axis(2, at=seq_len(nrow(mat_center)), labels=rev(rownames(mat_center)), las=2, cex.axis=cex_row)
+  
+  # scale bar (panel 2)
+  par(mar=c(6,2,3,4))
+  yseq <- seq(zlim[1], zlim[2], length.out=101)
+  zbar <- matrix(yseq, nrow=1)
+  image(x=c(0,1), y=yseq, z=zbar, col=cols, axes=FALSE, xlab="", ylab="")
+  axis(4, las=1, cex.axis=0.8)
+  mtext(scale_label, side=4, line=2.2, cex=0.9)
+  
+  dev.off()
+  layout(1)
+}
+
+for (ct in celltypes) {
+  de <- de_ckdonly_all[[ct]]
+  if (is.null(de) || nrow(de)==0) next
+  
+  top_up <- de %>% filter(logFC > 0) %>% arrange(FDR) %>% head(20)
+  top_dn <- de %>% filter(logFC < 0) %>% arrange(FDR) %>% head(20)
+  genes_keep <- unique(c(top_up$gene, top_dn$gene))
+  
+  sub <- subset(ckd.sub, subset = celltype6==ct & condition=="CKD")
+  pb <- make_pseudobulk(sub, group_vars=c("sample","model","celltype6","condition"))
+  mat <- pb$counts
+  meta_pb <- pb$meta[colnames(mat), , drop=FALSE]
+  
+  mat_log <- log1p(mat)
+  
+  genes_keep <- genes_keep[genes_keep %in% rownames(mat_log)]
+  if (length(genes_keep) < 2) next
+  
+  ord <- order(meta_pb$model, meta_pb$sample)
+  mat_log <- mat_log[genes_keep, ord, drop=FALSE]
+  meta_pb <- meta_pb[ord, , drop=FALSE]
+  
+  mat_center <- mat_log - rowMeans(mat_log)
+  
+  col_labs <- paste(meta_pb$model, meta_pb$sample, sep=" | ")
+  
+  plot_heatmap_image(
+    mat_center,
+    col_labels = col_labs,
+    main_title = paste0(ct, " CKD-only (Top20 UP/DOWN) — columns: samples — rows: fixed"),
+    file = file.path(heat_dir, paste0("HEATMAP_", ct, "_Top20_UPDOWN_CKDonly_ROWSfixed.png")),
+    cluster_rows = FALSE,
+    width=1600, height=1200, res=200,
+    cex_col=0.7, cex_row=0.55,
+    scale_label="Centered log1p (gene-centered)"
+  )
+  
+  plot_heatmap_image(
+    mat_center,
+    col_labels = col_labs,
+    main_title = paste0(ct, " CKD-only (Top20 UP/DOWN) — columns: samples — rows: clustered"),
+    file = file.path(heat_dir, paste0("HEATMAP_", ct, "_Top20_UPDOWN_CKDonly_ROWSclustered.png")),
+    cluster_rows = TRUE,
+    width=1600, height=1200, res=200,
+    cex_col=0.7, cex_row=0.55,
+    scale_label="Centered log1p (gene-centered)"
+  )
+  
+  out_mat <- as.data.frame(mat_log[genes_keep, , drop=FALSE])
+  out_mat$gene <- rownames(out_mat)
+  out_mat <- out_mat %>% relocate(gene)
+  write_xlsx_one(out_mat, file.path(out_xlsx, paste0("HEATMAP_MATRIX_log1p_", ct, "_Top20_UPDOWN.xlsx")), sheet="log1p_counts")
+}
+
+## =========================
+## 10B) HEATMAPS (Collapsed replicates): CKD1 vs CKD2 only (CKD-only)
+##     ✅ FIXED: heatmap + legend in same PNG; collapsed means by model
+## =========================
+heat_dir_collapsed <- file.path(out_fig, "HEATMAPS_Top20_Collapsed_CKD1vsCKD2")
+dir.create(heat_dir_collapsed, showWarnings = FALSE, recursive = TRUE)
+
+for (ct in celltypes) {
+  de <- de_ckdonly_all[[ct]]
+  if (is.null(de) || nrow(de) == 0) next
+  
+  top_up <- de %>% filter(logFC > 0) %>% arrange(FDR) %>% head(20)
+  top_dn <- de %>% filter(logFC < 0) %>% arrange(FDR) %>% head(20)
+  genes_keep <- unique(c(top_up$gene, top_dn$gene))
+  genes_keep <- genes_keep[!is_mt_gene(genes_keep)]
+  
+  sub <- subset(ckd.sub, subset = celltype6 == ct & condition == "CKD")
+  if (ncol(sub) < 20) next
+  
+  pb <- make_pseudobulk(sub, group_vars = c("sample","model","celltype6","condition"))
+  mat <- pb$counts
+  meta_pb <- pb$meta[colnames(mat), , drop = FALSE]
+  
+  mat_log <- log1p(mat)
+  
+  genes_keep <- genes_keep[genes_keep %in% rownames(mat_log)]
+  if (length(genes_keep) < 2) next
+  
+  ck1_cols <- rownames(meta_pb)[meta_pb$model == "CKD1"]
+  ck2_cols <- rownames(meta_pb)[meta_pb$model == "CKD2"]
+  if (length(ck1_cols) == 0 || length(ck2_cols) == 0) next
+  
+  mat_collapsed <- cbind(
+    CKD1 = Matrix::rowMeans(mat_log[, ck1_cols, drop = FALSE]),
+    CKD2 = Matrix::rowMeans(mat_log[, ck2_cols, drop = FALSE])
+  )
+  mat_collapsed <- as.matrix(mat_collapsed)
+  rownames(mat_collapsed) <- rownames(mat_log)
+  
+  mat_collapsed <- mat_collapsed[genes_keep, , drop = FALSE]
+  mat_center <- mat_collapsed - rowMeans(mat_collapsed)
+  
+  plot_heatmap_image(
+    mat_center,
+    col_labels = colnames(mat_center),
+    main_title = paste0(ct, " CKD-only (Top20 UP/DOWN) — collapsed by model (CKD1 vs CKD2)"),
+    file = file.path(heat_dir_collapsed, paste0("HEATMAP_COLLAPSED_", ct, "_Top20_UPDOWN_CKD1vsCKD2.png")),
+    cluster_rows = FALSE,
+    width=1400, height=1100, res=200,
+    cex_col=0.95, cex_row=0.55,
+    scale_label="Centered log1p (model-mean, gene-centered)"
+  )
+  
+  out_mat <- as.data.frame(mat_collapsed)
+  out_mat$gene <- rownames(out_mat)
+  out_mat <- out_mat %>% relocate(gene)
+  write_xlsx_one(out_mat, file.path(out_xlsx, paste0("HEATMAP_MATRIX_COLLAPSED_log1p_", ct, "_Top20_UPDOWN.xlsx")),
+                 sheet = "log1p_collapsed")
+}
+
+## =========================
+## 11) VIOLIN PLOTS (Top genes; CKD-only) per celltype
+## =========================
+vln_dir <- file.path(out_fig, "VIOLINS_TopGenes")
+dir.create(vln_dir, showWarnings=FALSE, recursive=TRUE)
+
+DefaultAssay(ckd.sub) <- "RNA"
+ckd.sub[["RNA"]] <- JoinLayers(ckd.sub[["RNA"]])
+
+if (!"data" %in% Layers(ckd.sub[["RNA"]])) {
+  ckd.sub <- NormalizeData(ckd.sub, verbose=FALSE)
+}
+
+for (ct in celltypes) {
+  de <- de_ckdonly_all[[ct]]
+  if (is.null(de) || nrow(de)==0) next
+  
+  top10_ckd1 <- de %>% filter(logFC < 0) %>% arrange(FDR) %>% head(10) %>% pull(gene)
+  top10_ckd2 <- de %>% filter(logFC > 0) %>% arrange(FDR) %>% head(10) %>% pull(gene)
+  
+  top10_ckd1 <- top10_ckd1[top10_ckd1 %in% rownames(ckd.sub)]
+  top10_ckd2 <- top10_ckd2[top10_ckd2 %in% rownames(ckd.sub)]
+  
+  sub <- subset(ckd.sub, subset = celltype6==ct & condition=="CKD")
+  sub$model <- factor(sub$model, levels=c("CKD1","CKD2"))
+  
+  if (length(top10_ckd1) > 0) {
+    p1 <- VlnPlot(sub, features=top10_ckd1, group.by="model", pt.size=0, ncol=2) +
+      theme_classic(base_size=14) +
+      ggtitle(paste0(ct, " CKD-only: Top10 higher in CKD1"))
+    
+    save_plot(p1, file.path(vln_dir, paste0("VIOLIN_", ct, "_Top10_highIn_CKD1.png")), w=10, h=12, dpi=450)
+    ggsave(file.path(vln_dir, paste0("VIOLIN_", ct, "_Top10_highIn_CKD1.pdf")), plot=p1, width=10, height=12)
+  }
+  
+  if (length(top10_ckd2) > 0) {
+    p2 <- VlnPlot(sub, features=top10_ckd2, group.by="model", pt.size=0, ncol=2) +
+      theme_classic(base_size=14) +
+      ggtitle(paste0(ct, " CKD-only: Top10 higher in CKD2"))
+    
+    save_plot(p2, file.path(vln_dir, paste0("VIOLIN_", ct, "_Top10_highIn_CKD2.png")), w=10, h=12, dpi=450)
+    ggsave(file.path(vln_dir, paste0("VIOLIN_", ct, "_Top10_highIn_CKD2.pdf")), plot=p2, width=10, height=12)
+  }
+}
+
+message("✅ DONE. Outputs written to:\n",
+        "FIGURES: ", out_fig, "\n",
+        "EXCEL:   ", out_xlsx, "\n",
+        "CSV:     ", out_csv, "\n")
+
+
+## ============================================================
+## ADDENDUM: Export exact cell counts per model and condition
+## ============================================================
+library(dplyr)
+library(tidyr)
+library(openxlsx)
+library(Seurat)
+
+if (!exists("output_dir")) {
+  output_dir <- getwd()
+}
+
+if (!exists("seurat_obj")) {
+  seurat_candidates <- ls(envir = .GlobalEnv)[
+    sapply(ls(envir = .GlobalEnv), function(x) inherits(get(x, envir = .GlobalEnv), "Seurat"))
+  ]
+  if (length(seurat_candidates) == 0) {
+    stop("No Seurat object found in the environment. Please run the script up to the point where the Seurat object is created/loaded.")
+  }
+  seurat_obj <- get(seurat_candidates[1], envir = .GlobalEnv)
+  message("Using Seurat object: ", seurat_candidates[1])
+}
+
+if (!exists("output_dir")) {
+  output_dir <- getwd()
+}
+
+celltype_col  <- "celltype6"
+model_col     <- "model"
+condition_col <- "condition"
+
+meta_df <- seurat_obj@meta.data %>%
+  dplyr::select(
+    celltype  = all_of(celltype_col),
+    model     = all_of(model_col),
+    condition = all_of(condition_col)
+  )
+
+cell_counts_long <- meta_df %>%
+  dplyr::count(model, condition, celltype, name = "n_cells") %>%
+  dplyr::arrange(model, condition, celltype)
+
+cell_counts_wide <- cell_counts_long %>%
+  tidyr::unite(group, model, condition, sep = "_") %>%
+  tidyr::pivot_wider(
+    names_from  = group,
+    values_from = n_cells,
+    values_fill = 0
+  )
+
+out_xlsx2 <- file.path(
+  output_dir,
+  "CellCounts_perCelltype_Model_and_Condition_CTRL_CKD.xlsx"
+)
+
+wb <- createWorkbook()
+
+addWorksheet(wb, "Long_format_counts")
+writeData(wb, "Long_format_counts", cell_counts_long)
+
+addWorksheet(wb, "Wide_format_counts")
+writeData(wb, "Wide_format_counts", cell_counts_wide)
+
+for (sheet in c("Long_format_counts", "Wide_format_counts")) {
+  setColWidths(wb, sheet, cols = 1:50, widths = "auto")
+  freezePane(wb, sheet, firstRow = TRUE)
+}
+
+saveWorkbook(wb, out_xlsx2, overwrite = TRUE)
+
+message("Cell count Excel exported to: ", out_xlsx2)
